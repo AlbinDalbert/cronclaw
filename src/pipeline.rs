@@ -44,11 +44,9 @@ pub struct Output {
     pub tmp: String,
 }
 
-pub fn load(path: &Path) -> Result<Pipeline, String> {
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-    let pipeline: Pipeline = serde_yaml::from_str(&content)
-        .map_err(|e| format!("failed to parse {}: {}", path.display(), e))?;
+pub fn parse(content: &str) -> Result<Pipeline, String> {
+    let pipeline: Pipeline = serde_yaml::from_str(content)
+        .map_err(|e| format!("failed to parse pipeline: {}", e))?;
 
     for step in &pipeline.steps {
         match step.step_type {
@@ -69,4 +67,10 @@ pub fn load(path: &Path) -> Result<Pipeline, String> {
     }
 
     Ok(pipeline)
+}
+
+pub fn load(path: &Path) -> Result<Pipeline, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+    parse(&content).map_err(|e| format!("{}: {}", path.display(), e))
 }

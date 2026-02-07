@@ -227,7 +227,7 @@ fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(), String> 
 }
 
 /// Replace {{ file:path }} with the contents of the file relative to workspace.
-fn resolve_templates(input: &str, workspace: &Path) -> Result<String, String> {
+pub fn resolve_templates(input: &str, workspace: &Path) -> Result<String, String> {
     let re = Regex::new(r"\{\{\s*file:\s*(.+?)\s*\}\}").unwrap();
     let mut result = input.to_string();
 
@@ -257,7 +257,7 @@ fn resolve_templates(input: &str, workspace: &Path) -> Result<String, String> {
     Ok(result)
 }
 
-fn promote_outputs(step: &Step, workspace: &Path) -> Result<(), String> {
+pub fn promote_outputs(step: &Step, workspace: &Path) -> Result<(), String> {
     for output in &step.outputs {
         let tmp_path = workspace.join(&output.tmp);
         let final_path = workspace.join(&output.path);

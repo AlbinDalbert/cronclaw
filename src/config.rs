@@ -4,10 +4,18 @@ use std::path::Path;
 
 const DEFAULT_TIMEOUT: u64 = 300; // 5 minutes
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
 }
 
 fn default_timeout() -> u64 {
