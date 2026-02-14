@@ -4,8 +4,7 @@ mod runner;
 mod state;
 
 use clap::{Parser, Subcommand};
-use fs2::FileExt;
-use std::fs::{self, File};
+use std::fs;
 use std::path::PathBuf;
 
 fn cronclaw_home() -> PathBuf {
@@ -67,17 +66,6 @@ fn cmd_run(verbose: bool) {
         std::process::exit(1);
     }
 
-    // Acquire exclusive lock — if another runner is active, exit immediately
-    let lock_path = home.join("lock");
-    let lock_file = File::create(&lock_path).expect("failed to create lock file");
-    if lock_file.try_lock_exclusive().is_err() {
-        if verbose {
-            eprintln!("another cronclaw run is already in progress — exiting");
-        }
-        return;
-    }
-    // Lock held until lock_file is dropped at end of function
-
     let cfg = config::load(&home.join("config.yaml"));
 
     let pipelines_dir = home.join("pipelines");
@@ -123,7 +111,10 @@ fn cmd_reset(pipeline: &str) {
     let state_file = home.join("pipelines").join(pipeline).join("state.json");
 
     if !state_file.exists() {
-        println!("No state file for pipeline '{}'. Nothing to reset.", pipeline);
+        println!(
+            "No state file for pipeline '{}'. Nothing to reset.",
+            pipeline
+        );
         return;
     }
 

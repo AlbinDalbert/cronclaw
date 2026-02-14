@@ -1,33 +1,49 @@
-use std::fs;
+use std::fs::{self, File};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use regex::Regex;
 
 use crate::config::Config;
 use crate::pipeline::{Step, StepType};
 use crate::state::{self, State, StepStatus};
 
-pub fn run_pipeline(pipeline_dir: &Path, cfg: &Config, verbose: bool) -> Result<(), String> {
-    let pipeline_file = pipeline_dir.join("pipeline.yaml");
+/// Result of acquiring the state lock and deciding what to do.
+struct Ticket {
+    step_index: usize,
+    step_id: String,
+    timeout_secs: u64,
+    state: State,
+}
+
+/// Lock state.json, load state, find the next pending step, mark it running,
+/// save, and release the lock. Returns None if there's nothing to do.
+fn acquire_ticket(
+    pipeline_dir: &Path,
+    pipeline: &crate::pipeline::Pipeline,
+    cfg: &Config,
+    verbose: bool,
+) -> Result<Option<Ticket>, String> {
     let state_file = pipeline_dir.join("state.json");
-    let pipeline_name = pipeline_dir
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-
-    let pipeline = crate::pipeline::load(&pipeline_file)?;
     let workspace = pipeline_dir.join(&pipeline.workspace);
+    let pipeline_name = pipeline_dir.file_name().unwrap().to_string_lossy();
 
-    // Load or create state
+    // Lock state.json for the read-decide-write transition
+    let lock_file = File::create(pipeline_dir.join("state.lock"))
+        .map_err(|e| format!("[{}] failed to create state lock: {}", pipeline_name, e))?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|e| format!("[{}] failed to acquire state lock: {}", pipeline_name, e))?;
+
+    // Load or create state (while holding lock)
     let mut state = match state::load(&state_file)? {
         Some(s) => s,
         None => {
             fs::create_dir_all(&workspace)
                 .map_err(|e| format!("failed to create workspace: {}", e))?;
-            let s = State::from_pipeline(&pipeline);
+            let s = State::from_pipeline(pipeline);
             state::save(&state_file, &s)?;
             s
         }
@@ -49,7 +65,7 @@ pub fn run_pipeline(pipeline_dir: &Path, cfg: &Config, verbose: bool) -> Result<
         }
     }
 
-    // Walk steps in pipeline order, find the first non-completed one
+    // Find the next actionable step
     for (i, step) in pipeline.steps.iter().enumerate() {
         let step_state = &state.steps[&step.id];
 
@@ -62,7 +78,7 @@ pub fn run_pipeline(pipeline_dir: &Path, cfg: &Config, verbose: bool) -> Result<
                         pipeline_name, step.id
                     );
                 }
-                return Ok(());
+                return Ok(None);
             }
             StepStatus::Failed => {
                 if verbose {
@@ -71,79 +87,94 @@ pub fn run_pipeline(pipeline_dir: &Path, cfg: &Config, verbose: bool) -> Result<
                         pipeline_name, step.id
                     );
                 }
-                return Ok(());
+                return Ok(None);
             }
             StepStatus::Pending => {
-                let timeout_secs = step.timeout.unwrap_or(cfg.timeout);
-
-                println!(
-                    "[{}] running step {}/{}: '{}' ({})",
-                    pipeline_name,
-                    i + 1,
-                    pipeline.steps.len(),
-                    step.id,
-                    match step.step_type {
-                        StepType::Bash => "bash",
-                        StepType::Agent => "agent",
-                    }
-                );
-
-                // Mark as running before execution
-                state
-                    .steps
-                    .get_mut(&step.id)
-                    .unwrap()
-                    .status = StepStatus::Running;
+                // Mark as running and save while we still hold the lock
+                state.steps.get_mut(&step.id).unwrap().status = StepStatus::Running;
                 state::save(&state_file, &state)?;
 
-                // Execute
-                match execute_step(step, &workspace, timeout_secs) {
-                    Ok(()) => {
-                        promote_outputs(step, &workspace)?;
-
-                        state
-                            .steps
-                            .get_mut(&step.id)
-                            .unwrap()
-                            .status = StepStatus::Completed;
-                        state::save(&state_file, &state)?;
-
-                        // Check if that was the last step
-                        let all_done = pipeline.steps.iter().all(|s| {
-                            state
-                                .steps
-                                .get(&s.id)
-                                .map(|ss| ss.status == StepStatus::Completed)
-                                .unwrap_or(false)
-                        });
-                        if all_done {
-                            println!("[{}] pipeline completed", pipeline_name);
-                        }
-                    }
-                    Err(e) => {
-                        state
-                            .steps
-                            .get_mut(&step.id)
-                            .unwrap()
-                            .status = StepStatus::Failed;
-                        state::save(&state_file, &state)?;
-
-                        return Err(format!(
-                            "[{}] step '{}' failed: {}",
-                            pipeline_name, step.id, e
-                        ));
-                    }
-                }
-
-                return Ok(());
+                // Lock released when lock_file is dropped here
+                return Ok(Some(Ticket {
+                    step_index: i,
+                    step_id: step.id.clone(),
+                    timeout_secs: step.timeout.unwrap_or(cfg.timeout),
+                    state,
+                }));
             }
         }
     }
 
-    // All steps completed already — silent unless verbose
+    // All steps completed
     if verbose {
         println!("[{}] pipeline already completed", pipeline_name);
     }
+    Ok(None)
+}
+
+pub fn run_pipeline(pipeline_dir: &Path, cfg: &Config, verbose: bool) -> Result<(), String> {
+    let pipeline_file = pipeline_dir.join("pipeline.yaml");
+    let state_file = pipeline_dir.join("state.json");
+    let pipeline_name = pipeline_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let pipeline = crate::pipeline::load(&pipeline_file)?;
+    let workspace = pipeline_dir.join(&pipeline.workspace);
+
+    // Acquire a ticket: lock state, find next step, mark running, release lock
+    let mut ticket = match acquire_ticket(pipeline_dir, &pipeline, cfg, verbose)? {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    let step = &pipeline.steps[ticket.step_index];
+
+    println!(
+        "[{}] running step {}/{}: '{}' ({})",
+        pipeline_name,
+        ticket.step_index + 1,
+        pipeline.steps.len(),
+        step.id,
+        match step.step_type {
+            StepType::Bash => "bash",
+            StepType::Agent => "agent",
+        }
+    );
+
+    // Execute step (no lock held — other pipelines and processes are free to run)
+    match execute_step(step, &workspace, ticket.timeout_secs) {
+        Ok(()) => {
+            promote_outputs(step, &workspace)?;
+
+            ticket.state.steps.get_mut(&ticket.step_id).unwrap().status = StepStatus::Completed;
+            state::save(&state_file, &ticket.state)?;
+
+            let all_done = pipeline.steps.iter().all(|s| {
+                ticket
+                    .state
+                    .steps
+                    .get(&s.id)
+                    .map(|ss| ss.status == StepStatus::Completed)
+                    .unwrap_or(false)
+            });
+            if all_done {
+                println!("[{}] pipeline completed", pipeline_name);
+            }
+        }
+        Err(e) => {
+            ticket.state.steps.get_mut(&ticket.step_id).unwrap().status = StepStatus::Failed;
+            state::save(&state_file, &ticket.state)?;
+
+            return Err(format!(
+                "[{}] step '{}' failed: {}",
+                pipeline_name, step.id, e
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -204,10 +235,7 @@ fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(), String> 
                 if status.success() {
                     return Ok(());
                 } else {
-                    return Err(format!(
-                        "exited with code {}",
-                        status.code().unwrap_or(-1)
-                    ));
+                    return Err(format!("exited with code {}", status.code().unwrap_or(-1)));
                 }
             }
             Ok(None) => {
