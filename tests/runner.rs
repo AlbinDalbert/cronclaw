@@ -3,7 +3,12 @@ use cronclaw::pipeline;
 use cronclaw::runner;
 use cronclaw::state::{self, State, StepStatus};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::sync::Mutex;
 use tempfile::TempDir;
+
+/// Mutex to serialize agent tests that mutate OPENCLAW_BIN env var.
+static OPENCLAW_BIN_LOCK: Mutex<()> = Mutex::new(());
 
 // ─── Template resolution ───
 
@@ -92,7 +97,10 @@ steps:
     runner::promote_outputs(&p.steps[0], dir.path()).unwrap();
 
     assert!(!dir.path().join("out.txt.tmp").exists());
-    assert_eq!(fs::read_to_string(dir.path().join("out.txt")).unwrap(), "data");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "data"
+    );
 }
 
 #[test]
@@ -358,4 +366,500 @@ steps:
     let s = state::load(&pd.join("state.json")).unwrap().unwrap();
     assert_eq!(s.steps["stuck"].status, StepStatus::Running);
     assert_eq!(s.steps["next"].status, StepStatus::Pending);
+}
+
+// ─── Agent step integration ───
+
+/// Create a fake `openclaw` script in a temp dir and return its absolute path.
+fn install_fake_openclaw(dir: &std::path::Path, script_body: &str) -> std::path::PathBuf {
+    let script_path = dir.join("fake-openclaw");
+    fs::write(&script_path, format!("#!/bin/sh\n{}", script_body)).unwrap();
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+    script_path
+}
+
+/// Run a pipeline with OPENCLAW_BIN pointed at a fake script.
+/// Uses a mutex so concurrent tests don't clobber each other's env var.
+fn run_with_fake_openclaw(
+    pipeline_dir: &std::path::Path,
+    fake_bin: &std::path::Path,
+    cfg: &Config,
+) -> Result<(), String> {
+    let _guard = OPENCLAW_BIN_LOCK.lock().unwrap();
+
+    // SAFETY: serialized by mutex — no concurrent env mutation.
+    unsafe { std::env::set_var("OPENCLAW_BIN", fake_bin) };
+    let result = runner::run_pipeline(pipeline_dir, cfg, false);
+    unsafe { std::env::remove_var("OPENCLAW_BIN") };
+
+    result
+}
+
+#[test]
+fn run_agent_step_completes_on_success() {
+    let dir = TempDir::new().unwrap();
+
+    let fake_bin = install_fake_openclaw(dir.path(), "exit 0");
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: analyse
+    type: agent
+    agent: pro-worker
+    prompt: "Analyse this data"
+    output: analysis.md
+"#,
+    );
+
+    let cfg = Config::default();
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+
+    let s = state::load(&pd.join("state.json")).unwrap().unwrap();
+    assert_eq!(s.steps["analyse"].status, StepStatus::Completed);
+}
+
+#[test]
+fn run_agent_step_fails_on_nonzero_exit() {
+    let dir = TempDir::new().unwrap();
+
+    let fake_bin = install_fake_openclaw(dir.path(), "echo 'agent error' >&2\nexit 1");
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: analyse
+    type: agent
+    agent: pro-worker
+    prompt: "Analyse this data"
+    output: analysis.md
+"#,
+    );
+
+    let cfg = Config::default();
+    let result = run_with_fake_openclaw(&pd, &fake_bin, &cfg);
+    assert!(result.is_err());
+
+    let s = state::load(&pd.join("state.json")).unwrap().unwrap();
+    assert_eq!(s.steps["analyse"].status, StepStatus::Failed);
+}
+
+#[test]
+fn run_agent_step_resolves_templates() {
+    let dir = TempDir::new().unwrap();
+
+    let fake_bin = install_fake_openclaw(
+        dir.path(),
+        r#"
+# Find --message arg value
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --message) shift; echo "$1" > "$PWD/received_prompt.txt"; break;;
+        *) shift;;
+    esac
+done
+exit 0
+"#,
+    );
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: analyse
+    type: agent
+    agent: worker
+    prompt: |
+      Here is the data:
+      {{ file:data.json }}
+    output: analysis.md
+"#,
+    );
+
+    // Create the workspace and the file to inject
+    let workspace = pd.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(workspace.join("data.json"), r#"{"value": 42}"#).unwrap();
+
+    let cfg = Config::default();
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+
+    // Verify the template was resolved before passing to openclaw
+    let received = fs::read_to_string(workspace.join("received_prompt.txt")).unwrap();
+    assert!(received.contains(r#"{"value": 42}"#));
+    assert!(!received.contains("{{ file:"));
+}
+
+#[test]
+fn run_agent_step_promotes_outputs() {
+    let dir = TempDir::new().unwrap();
+
+    let fake_bin = install_fake_openclaw(
+        dir.path(),
+        r#"echo "result data" > "$PWD/result.txt.tmp"
+exit 0"#,
+    );
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: analyse
+    type: agent
+    agent: worker
+    prompt: "do work"
+    output: agent-out.md
+    outputs:
+      - name: result
+        path: result.txt
+        tmp: result.txt.tmp
+"#,
+    );
+
+    let workspace = pd.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let cfg = Config::default();
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+
+    // tmp should be promoted to final
+    assert!(!workspace.join("result.txt.tmp").exists());
+    assert!(workspace.join("result.txt").exists());
+    let content = fs::read_to_string(workspace.join("result.txt")).unwrap();
+    assert!(content.contains("result data"));
+}
+
+#[test]
+fn run_mixed_bash_and_agent_steps() {
+    let dir = TempDir::new().unwrap();
+
+    let fake_bin = install_fake_openclaw(dir.path(), "exit 0");
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: prep
+    type: bash
+    bash: echo "prepared"
+  - id: analyse
+    type: agent
+    agent: worker
+    prompt: "do analysis"
+    output: analysis.md
+  - id: cleanup
+    type: bash
+    bash: echo "done"
+"#,
+    );
+
+    let cfg = Config::default();
+
+    // Tick 1 — bash step
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+    let s = state::load(&pd.join("state.json")).unwrap().unwrap();
+    assert_eq!(s.steps["prep"].status, StepStatus::Completed);
+    assert_eq!(s.steps["analyse"].status, StepStatus::Pending);
+
+    // Tick 2 — agent step
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+    let s = state::load(&pd.join("state.json")).unwrap().unwrap();
+    assert_eq!(s.steps["analyse"].status, StepStatus::Completed);
+    assert_eq!(s.steps["cleanup"].status, StepStatus::Pending);
+
+    // Tick 3 — bash step
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+    let s = state::load(&pd.join("state.json")).unwrap().unwrap();
+    assert_eq!(s.steps["cleanup"].status, StepStatus::Completed);
+}
+
+#[test]
+fn run_agent_stdout_captured_to_output_file() {
+    let dir = TempDir::new().unwrap();
+
+    let fake_bin = install_fake_openclaw(dir.path(), r#"echo "agent response content""#);
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: analyse
+    type: agent
+    agent: worker
+    prompt: "do work"
+    output: result.md
+"#,
+    );
+
+    let cfg = Config::default();
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+
+    let workspace = pd.join("workspace");
+    let content = fs::read_to_string(workspace.join("result.md")).unwrap();
+    assert!(content.contains("agent response content"));
+}
+
+#[test]
+fn run_agent_stderr_captured_to_error_file() {
+    let dir = TempDir::new().unwrap();
+
+    let fake_bin = install_fake_openclaw(dir.path(), "echo 'some warning' >&2\necho 'response'");
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: analyse
+    type: agent
+    agent: worker
+    prompt: "do work"
+    output: result.md
+    error: analyse.err
+"#,
+    );
+
+    let cfg = Config::default();
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+
+    let workspace = pd.join("workspace");
+    let err_content = fs::read_to_string(workspace.join("analyse.err")).unwrap();
+    assert!(err_content.contains("some warning"));
+}
+
+#[test]
+fn run_agent_stderr_captured_to_custom_error_file() {
+    let dir = TempDir::new().unwrap();
+
+    let fake_bin = install_fake_openclaw(dir.path(), "echo 'debug info' >&2\necho 'response'");
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: analyse
+    type: agent
+    agent: worker
+    prompt: "do work"
+    output: result.md
+    error: custom-errors.log
+"#,
+    );
+
+    let cfg = Config::default();
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+
+    let workspace = pd.join("workspace");
+    let err_content = fs::read_to_string(workspace.join("custom-errors.log")).unwrap();
+    assert!(err_content.contains("debug info"));
+    // Default error file should NOT exist
+    assert!(!workspace.join("analyse.err").exists());
+}
+
+#[test]
+fn run_agent_output_consumable_by_next_step_template() {
+    let dir = TempDir::new().unwrap();
+
+    // First agent writes its response to stdout
+    let fake_bin = install_fake_openclaw(dir.path(), r#"echo "analysis result 42""#);
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: analyse
+    type: agent
+    agent: worker
+    prompt: "analyse data"
+    output: analysis.md
+  - id: report
+    type: bash
+    bash: cat analysis.md > report.txt
+"#,
+    );
+
+    let cfg = Config::default();
+
+    // Tick 1 — agent step writes output
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+
+    // Tick 2 — bash step consumes the agent's output file
+    run_with_fake_openclaw(&pd, &fake_bin, &cfg).unwrap();
+
+    let workspace = pd.join("workspace");
+    let report = fs::read_to_string(workspace.join("report.txt")).unwrap();
+    assert!(report.contains("analysis result 42"));
+}
+
+#[test]
+fn run_bash_stdout_captured_to_output_file() {
+    let dir = TempDir::new().unwrap();
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: greet
+    type: bash
+    bash: echo "hello from bash"
+    output: greeting.txt
+"#,
+    );
+
+    let cfg = Config::default();
+    runner::run_pipeline(&pd, &cfg, false).unwrap();
+
+    let workspace = pd.join("workspace");
+    let content = fs::read_to_string(workspace.join("greeting.txt")).unwrap();
+    assert!(content.contains("hello from bash"));
+}
+
+#[test]
+fn run_bash_stderr_captured_to_error_file() {
+    let dir = TempDir::new().unwrap();
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: warn
+    type: bash
+    bash: echo "warning msg" >&2
+    error: warnings.log
+"#,
+    );
+
+    let cfg = Config::default();
+    runner::run_pipeline(&pd, &cfg, false).unwrap();
+
+    let workspace = pd.join("workspace");
+    let content = fs::read_to_string(workspace.join("warnings.log")).unwrap();
+    assert!(content.contains("warning msg"));
+}
+
+#[test]
+fn run_void_output_discards_stdout() {
+    let dir = TempDir::new().unwrap();
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: noisy
+    type: bash
+    bash: echo "discard me"
+    output: null
+"#,
+    );
+
+    let cfg = Config::default();
+    runner::run_pipeline(&pd, &cfg, false).unwrap();
+
+    // Step should complete successfully, no output file created
+    let s = state::load(&pd.join("state.json")).unwrap().unwrap();
+    assert_eq!(s.steps["noisy"].status, StepStatus::Completed);
+}
+
+#[test]
+fn run_default_output_no_file_created() {
+    let dir = TempDir::new().unwrap();
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: hello
+    type: bash
+    bash: echo "terminal output"
+"#,
+    );
+
+    let cfg = Config::default();
+    runner::run_pipeline(&pd, &cfg, false).unwrap();
+
+    // No output/error files should be created in workspace
+    let workspace = pd.join("workspace");
+    let entries: Vec<_> = fs::read_dir(&workspace)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "workspace should have no files, got: {:?}",
+        entries
+    );
+}
+
+#[test]
+fn run_agent_missing_binary_gives_helpful_error() {
+    let dir = TempDir::new().unwrap();
+
+    let pd = pipeline_dir(dir.path());
+    setup_pipeline(
+        dir.path(),
+        r#"
+version: 1
+workspace: workspace
+steps:
+  - id: analyse
+    type: agent
+    agent: worker
+    prompt: "do work"
+    output: result.md
+"#,
+    );
+
+    let cfg = Config::default();
+
+    // Point OPENCLAW_BIN at a nonexistent binary
+    let fake_bin = dir.path().join("nonexistent-openclaw");
+    let result = run_with_fake_openclaw(&pd, &fake_bin, &cfg);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("openclaw binary not found"),
+        "expected helpful error, got: {}",
+        err
+    );
 }

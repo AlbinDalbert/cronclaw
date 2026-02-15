@@ -1,4 +1,4 @@
-use cronclaw::pipeline::{self, StepType};
+use cronclaw::pipeline::{self, StepType, StreamTarget};
 
 // ─── Minimal valid pipelines ───
 
@@ -19,6 +19,8 @@ steps:
     assert_eq!(p.steps[0].id, "hello");
     assert_eq!(p.steps[0].step_type, StepType::Bash);
     assert_eq!(p.steps[0].bash.as_deref(), Some("echo \"hello\""));
+    assert_eq!(p.steps[0].output, StreamTarget::Terminal);
+    assert_eq!(p.steps[0].error, StreamTarget::Terminal);
     assert!(p.steps[0].outputs.is_empty());
     assert!(p.steps[0].timeout.is_none());
 }
@@ -33,11 +35,17 @@ steps:
     type: agent
     agent: pro-worker
     prompt: Do some research.
+    output: research.md
 "#;
     let p = pipeline::parse(yaml).unwrap();
     assert_eq!(p.steps[0].step_type, StepType::Agent);
     assert_eq!(p.steps[0].agent.as_deref(), Some("pro-worker"));
     assert_eq!(p.steps[0].prompt.as_deref(), Some("Do some research."));
+    assert_eq!(
+        p.steps[0].output,
+        StreamTarget::File("research.md".to_string())
+    );
+    assert_eq!(p.steps[0].error, StreamTarget::Terminal);
 }
 
 // ─── Full-featured pipeline ───
@@ -61,6 +69,7 @@ steps:
     prompt: |
       Research today's tech news.
       Write the result to summary.md.tmp.
+    output: research-result.md
     outputs:
       - name: summary
         path: summary.md
@@ -129,6 +138,7 @@ steps:
   - id: agent-step
     type: agent
     agent: worker
+    output: result.md
     prompt: |
       First line of prompt.
       Second line of prompt.
@@ -213,6 +223,7 @@ steps:
   - id: broken
     type: agent
     prompt: Do something.
+    output: out.md
 "#;
     let err = pipeline::parse(yaml).unwrap_err();
     assert!(err.contains("broken"));
@@ -228,6 +239,7 @@ steps:
   - id: broken
     type: agent
     agent: worker
+    output: out.md
 "#;
     let err = pipeline::parse(yaml).unwrap_err();
     assert!(err.contains("broken"));
@@ -317,6 +329,87 @@ steps: []
     assert!(p.steps.is_empty());
 }
 
+// ─── Stream target (output/error) fields ───
+
+#[test]
+fn output_missing_defaults_to_terminal() {
+    let yaml = r#"
+version: 1
+workspace: workspace
+steps:
+  - id: hello
+    type: bash
+    bash: echo hi
+"#;
+    let p = pipeline::parse(yaml).unwrap();
+    assert_eq!(p.steps[0].output, StreamTarget::Terminal);
+    assert_eq!(p.steps[0].error, StreamTarget::Terminal);
+}
+
+#[test]
+fn output_null_parses_as_void() {
+    let yaml = r#"
+version: 1
+workspace: workspace
+steps:
+  - id: hello
+    type: bash
+    bash: echo hi
+    output: null
+    error: null
+"#;
+    let p = pipeline::parse(yaml).unwrap();
+    assert_eq!(p.steps[0].output, StreamTarget::Void);
+    assert_eq!(p.steps[0].error, StreamTarget::Void);
+}
+
+#[test]
+fn output_path_parses_as_file() {
+    let yaml = r#"
+version: 1
+workspace: workspace
+steps:
+  - id: hello
+    type: bash
+    bash: echo hi
+    output: result.txt
+    error: errors.log
+"#;
+    let p = pipeline::parse(yaml).unwrap();
+    assert_eq!(
+        p.steps[0].output,
+        StreamTarget::File("result.txt".to_string())
+    );
+    assert_eq!(
+        p.steps[0].error,
+        StreamTarget::File("errors.log".to_string())
+    );
+}
+
+#[test]
+fn parse_agent_step_with_custom_error() {
+    let yaml = r#"
+version: 1
+workspace: workspace
+steps:
+  - id: research
+    type: agent
+    agent: worker
+    prompt: Do research.
+    output: result.md
+    error: research.log
+"#;
+    let p = pipeline::parse(yaml).unwrap();
+    assert_eq!(
+        p.steps[0].output,
+        StreamTarget::File("result.md".to_string())
+    );
+    assert_eq!(
+        p.steps[0].error,
+        StreamTarget::File("research.log".to_string())
+    );
+}
+
 // ─── Optional fields don't interfere ───
 
 #[test]
@@ -330,12 +423,18 @@ steps:
     bash: echo hi
     agent: should-be-ignored
     prompt: also-ignored
+    output: also-ignored.md
+    error: also-ignored.err
 "#;
     let p = pipeline::parse(yaml).unwrap();
     assert_eq!(p.steps[0].step_type, StepType::Bash);
     assert_eq!(p.steps[0].bash.as_deref(), Some("echo hi"));
     // Extra fields are parsed but not validated for bash type
     assert_eq!(p.steps[0].agent.as_deref(), Some("should-be-ignored"));
+    assert_eq!(
+        p.steps[0].output,
+        StreamTarget::File("also-ignored.md".to_string())
+    );
 }
 
 #[test]

@@ -1,4 +1,5 @@
 mod config;
+mod openclaw;
 mod pipeline;
 mod runner;
 mod state;

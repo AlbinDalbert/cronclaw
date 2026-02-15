@@ -7,7 +7,7 @@ use fs2::FileExt;
 use regex::Regex;
 
 use crate::config::Config;
-use crate::pipeline::{Step, StepType};
+use crate::pipeline::{Step, StepType, StreamTarget};
 use crate::state::{self, State, StepStatus};
 
 /// Result of acquiring the state lock and deciding what to do.
@@ -179,32 +179,101 @@ pub fn run_pipeline(pipeline_dir: &Path, cfg: &Config, verbose: bool) -> Result<
 }
 
 fn execute_step(step: &Step, workspace: &Path, timeout_secs: u64) -> Result<(), String> {
-    match step.step_type {
+    // Build the command based on step type
+    let mut cmd = match step.step_type {
         StepType::Bash => {
             let script = step.bash.as_ref().unwrap();
-            run_with_timeout(
-                Command::new("sh")
-                    .arg("-c")
-                    .arg(script)
-                    .current_dir(workspace),
-                timeout_secs,
-            )
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(script).current_dir(workspace);
+            c
         }
         StepType::Agent => {
             let agent = step.agent.as_ref().unwrap();
             let raw_prompt = step.prompt.as_ref().unwrap();
             let prompt = resolve_templates(raw_prompt, workspace)?;
-
-            // TODO: integrate with OpenClaw agent runtime
-            eprintln!("agent execution not yet implemented");
-            eprintln!("  agent: {}", agent);
-            eprintln!("  prompt: {}", prompt.lines().next().unwrap_or("(empty)"));
-            Err("agent steps are not yet implemented".to_string())
+            crate::openclaw::build_command(agent, &prompt, workspace, timeout_secs)
         }
+    };
+
+    // Spawn with timeout, with a better error for missing openclaw
+    let output = spawn_with_timeout(&mut cmd, timeout_secs).map_err(|e| {
+        if step.step_type == StepType::Agent && e.contains("failed to spawn") {
+            let bin = crate::openclaw::resolve_binary();
+            format!(
+                "openclaw binary not found — is OpenClaw installed? (looked for: {})",
+                bin
+            )
+        } else {
+            e
+        }
+    })?;
+
+    // Route stdout
+    route_stream(&output.stdout, &step.output, workspace, "output")?;
+
+    // Route stderr
+    route_stream(&output.stderr, &step.error, workspace, "stderr")?;
+
+    // Check exit code
+    if output.status.success() {
+        Ok(())
+    } else {
+        // On failure, always print stderr to terminal for visibility
+        // (even if it was also written to a file)
+        if !matches!(step.error, StreamTarget::Terminal) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
+        }
+        Err(format!(
+            "exited with code {}",
+            output.status.code().unwrap_or(-1)
+        ))
     }
 }
 
-fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(), String> {
+/// Route a stream's bytes according to a StreamTarget.
+fn route_stream(
+    data: &[u8],
+    target: &StreamTarget,
+    workspace: &Path,
+    label: &str,
+) -> Result<(), String> {
+    match target {
+        StreamTarget::Terminal => {
+            if !data.is_empty() {
+                let text = String::from_utf8_lossy(data);
+                if label == "stderr" {
+                    eprint!("{}", text);
+                } else {
+                    print!("{}", text);
+                }
+            }
+        }
+        StreamTarget::Void => {}
+        StreamTarget::File(path) => {
+            let full_path = workspace.join(path);
+            fs::write(&full_path, data).map_err(|e| {
+                format!(
+                    "failed to write {} to '{}': {}",
+                    label,
+                    full_path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Spawn a command and wait for it to finish, with a timeout.
+/// Returns the raw process output on completion (success or failure).
+/// Returns Err only for spawn failures or timeouts.
+fn spawn_with_timeout(
+    cmd: &mut Command,
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -216,30 +285,12 @@ fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(), String> 
 
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process finished — collect output
-                let output = child
+            Ok(Some(_status)) => {
+                return child
                     .wait_with_output()
-                    .map_err(|e| format!("failed to read output: {}", e))?;
-
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-
-                if !stdout.is_empty() {
-                    print!("{}", stdout);
-                }
-                if !stderr.is_empty() {
-                    eprint!("{}", stderr);
-                }
-
-                if status.success() {
-                    return Ok(());
-                } else {
-                    return Err(format!("exited with code {}", status.code().unwrap_or(-1)));
-                }
+                    .map_err(|e| format!("failed to read output: {}", e));
             }
             Ok(None) => {
-                // Still running
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();

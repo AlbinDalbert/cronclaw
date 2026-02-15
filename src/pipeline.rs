@@ -2,6 +2,37 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
+/// Where to route a stream (stdout or stderr) from a step.
+///
+/// - Missing from YAML → `Terminal` (print to terminal)
+/// - `output: null`    → `Void` (discard)
+/// - `output: path`    → `File(path)` (write to file in workspace)
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamTarget {
+    Terminal,
+    Void,
+    File(String),
+}
+
+impl Default for StreamTarget {
+    fn default() -> Self {
+        StreamTarget::Terminal
+    }
+}
+
+impl<'de> Deserialize<'de> for StreamTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            None => Ok(StreamTarget::Void),
+            Some(s) => Ok(StreamTarget::File(s)),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Pipeline {
     pub version: u32,
@@ -18,6 +49,12 @@ pub struct Step {
     // Agent fields
     pub agent: Option<String>,
     pub prompt: Option<String>,
+
+    // Stream routing (shared across step types)
+    #[serde(default)]
+    pub output: StreamTarget,
+    #[serde(default)]
+    pub error: StreamTarget,
 
     // Bash fields
     pub bash: Option<String>,
@@ -45,14 +82,17 @@ pub struct Output {
 }
 
 pub fn parse(content: &str) -> Result<Pipeline, String> {
-    let pipeline: Pipeline = serde_yaml::from_str(content)
-        .map_err(|e| format!("failed to parse pipeline: {}", e))?;
+    let pipeline: Pipeline =
+        serde_yaml::from_str(content).map_err(|e| format!("failed to parse pipeline: {}", e))?;
 
     for step in &pipeline.steps {
         match step.step_type {
             StepType::Bash => {
                 if step.bash.is_none() {
-                    return Err(format!("step '{}': type is bash but 'bash' field is missing", step.id));
+                    return Err(format!(
+                        "step '{}': type is bash but 'bash' field is missing",
+                        step.id
+                    ));
                 }
             }
             StepType::Agent => {
